@@ -1,11 +1,30 @@
 name: Build MediaPipe APK
-on: [workflow_dispatch] # Запуск вручную кнопкой
+on: 
+  workflow_dispatch:  # Ручной запуск
+    inputs:
+      build_target:
+        description: 'Что собрать?'
+        required: true
+        default: 'handtrackinggpu'
+        type: choice
+        options:
+          - handtrackinggpu
+          - handdetectiongpu
+          - facetrackinggpu
+          - instantmotiontracking
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    concurrency:
+      group: build-mediapipe-${{ github.ref }}
+      cancel-in-progress: true
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # Ускоряем клонирование
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -13,21 +32,105 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Install Bazel
+      - name: Install Bazelisk (Bazel launcher)
+        run: |
+          npm install -g @bazel/bazelisk
+          sudo ln -s $(which bazelisk) /usr/local/bin/bazel
+          bazel --version
+
+      - name: Cache Bazel builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            bazel-out
+            bazel-testlogs
+          key: ${{ runner.os }}-bazel-${{ hashFiles('.bazelversion', 'WORKSPACE') }}
+          restore-keys: |
+            ${{ runner.os }}-bazel-
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-31
+            build-tools;30.0.3
+            ndk;25.1.8937393
+          cmdline-tools-version: 9477386
+
+      - name: Set Android environment
+        run: |
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/25.1.8937393" >> $GITHUB_ENV
+          echo "ANDROID_NDK=${ANDROID_SDK_ROOT}/ndk/25.1.8937393" >> $GITHUB_ENV
+
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install bazel-6.1.1
+          sudo apt-get install -y \
+            pkg-config \
+            zip \
+            g++ \
+            zlib1g-dev \
+            unzip \
+            python3 \
+            python3-pip
 
-      - name: Setup Android SDK/NDK
-        uses: android-actions/setup-android@v3
-
-      - name: Build Hand Tracking APK
+      - name: Install Python dependencies
         run: |
-          # Это команда сборки примера с руками (GPU версия)
-          bazel build -c opt --config=android_arm64 mediapipe/examples/android/src/java/com/google/mediapipe/apps/handtrackinggpu:handtrackinggpu
+          pip3 install --upgrade pip
+          pip3 install numpy opencv-python
+
+      - name: Build APK
+        run: |
+          # Определяем цель сборки
+          case "${{ github.event.inputs.build_target }}" in
+            "handtrackinggpu")
+              TARGET="mediapipe/examples/android/src/java/com/google/mediapipe/apps/handtrackinggpu:handtrackinggpu"
+              ;;
+            "handdetectiongpu")
+              TARGET="mediapipe/examples/android/src/java/com/google/mediapipe/apps/handdetectiongpu:handdetectiongpu"
+              ;;
+            "facetrackinggpu")
+              TARGET="mediapipe/examples/android/src/java/com/google/mediapipe/apps/facetrackinggpu:facetrackinggpu"
+              ;;
+            "instantmotiontracking")
+              TARGET="mediapipe/examples/android/src/java/com/google/mediapipe/apps/instantmotiontracking:instantmotiontracking"
+              ;;
+            *)
+              TARGET="mediapipe/examples/android/src/java/com/google/mediapipe/apps/handtrackinggpu:handtrackinggpu"
+              ;;
+          esac
           
+          echo "Building target: $TARGET"
+          
+          # Сборка с оптимизациями
+          bazel build -c opt \
+            --config=android_arm64 \
+            --action_env=ANDROID_HOME \
+            --action_env=ANDROID_NDK_HOME \
+            --cxxopt=-std=c++17 \
+            --host_cxxopt=-std=c++17 \
+            --verbose_failures \
+            $TARGET
+
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: mediapipe-hand-apk
-          path: bazel-bin/mediapipe/examples/android/src/java/com/google/mediapipe/apps/handtrackinggpu/handtrackinggpu.apk
+          name: ${{ github.event.inputs.build_target }}-apk
+          path: |
+            bazel-bin/mediapipe/examples/android/src/java/com/google/mediapipe/apps/*/*.apk
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload build logs (if failed)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-error-logs
+          path: |
+            bazel-out/error.log
+            /home/runner/.cache/bazel/
+          compression-level: 9
